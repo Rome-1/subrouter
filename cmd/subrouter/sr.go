@@ -794,7 +794,18 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 	}
 	switch provider {
 	case "codex", "openai", "chatgpt":
-		return r.add(ctx)
+		var flags []string
+		if len(args) > 0 {
+			flags = args[1:]
+		}
+		deviceAuth := false
+		for _, arg := range flags {
+			if arg != "--device-auth" {
+				return fmt.Errorf("usage: sr add codex [--device-auth]")
+			}
+			deviceAuth = true
+		}
+		return r.add(ctx, deviceAuth)
 	case "claude", "anthropic":
 		return r.claude(ctx, append([]string{"add"}, args[1:]...))
 	case "grok", "xai":
@@ -865,8 +876,8 @@ func (r srRunner) promptProvider() (string, error) {
 	}
 }
 
-func (r srRunner) add(ctx context.Context) error {
-	auth, email, err := r.isolatedCodexLogin(ctx, false)
+func (r srRunner) add(ctx context.Context, deviceAuth bool) error {
+	auth, email, err := r.isolatedCodexLogin(ctx, deviceAuth)
 	if err != nil {
 		return err
 	}

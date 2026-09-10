@@ -712,6 +712,9 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "grok") || strings.EqualFold(args[1], "xai")) {
 			return r.unsupportedRemoteCommand(command, server, "self-hosted Grok subscription import is not available yet; use 'sr remote use local' and then 'sr add grok'")
 		}
+		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "codex") || strings.EqualFold(args[1], "openai") || strings.EqualFold(args[1], "chatgpt")) {
+			args = append([]string{args[0]}, args[2:]...)
+		}
 		deviceAuth, err := parseRemoteAddArgs(command, args[1:])
 		if err != nil {
 			return err
@@ -801,7 +804,7 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 		deviceAuth := false
 		for _, arg := range flags {
 			if arg != "--device-auth" {
-				return fmt.Errorf("usage: sr add codex [--device-auth]")
+				return fmt.Errorf("usage: %s add codex [--device-auth]", r.programOrSubrouter())
 			}
 			deviceAuth = true
 		}

@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -49,5 +52,36 @@ func TestProviderAliasesResolve(t *testing.T) {
 		if err != nil && strings.Contains(err.Error(), "unknown provider") {
 			t.Errorf("alias %q was rejected as unknown", alias)
 		}
+	}
+}
+
+func TestProviderFirstAddAliasesNormalizeWithoutChangingArguments(t *testing.T) {
+	for _, provider := range []string{"codex", "claude"} {
+		input := []string{provider, "add", "--device-auth"}
+		got := normalizeProviderAddArgs(input)
+		if strings.Join(got, " ") != "add "+provider+" --device-auth" {
+			t.Fatalf("normalized %v", got)
+		}
+		if input[0] != provider {
+			t.Fatal("normalization mutated caller arguments")
+		}
+	}
+}
+
+func TestRemoteAddClaudeDispatchesToClaudeEnrollment(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	called := false
+	client := &http.Client{Transport: srRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host != "api.anthropic.com" {
+			t.Fatalf("wrong provider: %s", request.URL.Host)
+		}
+		called = true
+		return nil, errors.New("stop before storing test credential")
+	})}
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", store: accounts.CodexStore{Dir: t.TempDir()}, in: strings.NewReader(""), out: &out, errOut: &out, client: client}
+	err := runner.runRemoteAccountCommand(t.Context(), srServerConfig{Name: "selected", URL: "https://router.example.com"}, []string{"add", "claude", "work", "--token", testSetupToken})
+	if err == nil || !called {
+		t.Fatalf("Claude enrollment not reached: called=%v err=%v", called, err)
 	}
 }

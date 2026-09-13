@@ -2695,8 +2695,17 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 					return attestAndSaveTenantCodexOAuth(
 						ctx, s.AccountRef.client, s.AccountRef.store, account,
 						func(attested *accounts.StoredCodexAccount) error {
+							if !accounts.SameCodexOAuthIdentity(account.Auth, attested.Auth) {
+								return invalidAccountImport("Codex owner changed during transfer")
+							}
+							identity, identityErr := accounts.CodexOAuthIdentifier(attested.Auth)
+							if identityErr != nil {
+								return identityErr
+							}
+							attested.Email = identity
 							validated, validateErr := validateStoredAccountImport(input.Provider, *attested)
 							if validateErr == nil {
+								validated.Email = canonicalID
 								*attested = validated
 							}
 							return validateErr
@@ -2968,10 +2977,7 @@ func validateStoredAccountImportOrigin(provider accounts.Provider, account accou
 	if strings.TrimSpace(tokens.AccessToken) == "" || strings.TrimSpace(tokens.RefreshToken) == "" || strings.TrimSpace(tokens.IDToken) == "" {
 		return account, invalidAccountImport("OAuth account payload is incomplete")
 	}
-	email, err := accounts.ExtractEmailFromJWT(tokens.IDToken)
-	identifier, identifierErr := accounts.CodexOAuthIdentifier(account.Auth)
-	if err != nil || identifierErr != nil ||
-		(!strings.EqualFold(strings.TrimSpace(email), account.Email) && !strings.EqualFold(identifier, account.Email)) {
+	if !accounts.CodexIdentifierMatchesAuth(account.Email, account.Auth) {
 		return account, invalidAccountImport("OAuth identity does not match the account identifier")
 	}
 	if expiresAt, ok := accounts.JWTExpiryMillis(tokens.AccessToken); !ok || expiresAt <= time.Now().UnixMilli() {

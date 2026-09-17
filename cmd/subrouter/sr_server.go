@@ -1320,6 +1320,7 @@ type remoteServerAccountStatus struct {
 	ID          string            `json:"id"`
 	Provider    accounts.Provider `json:"provider"`
 	AuthMode    accounts.AuthMode `json:"auth_mode"`
+	Label       string            `json:"label,omitempty"`
 	Email       string            `json:"email,omitempty"`
 	Source      string            `json:"source"`
 	AuthChecked bool              `json:"auth_checked"`
@@ -1331,6 +1332,7 @@ type remoteServerAccountStatus struct {
 type remoteServerUsageStatus struct {
 	ID                 string                           `json:"id"`
 	Provider           accounts.Provider                `json:"provider"`
+	Label              string                           `json:"label,omitempty"`
 	AuthMode           accounts.AuthMode                `json:"auth_mode"`
 	Email              string                           `json:"email,omitempty"`
 	Source             string                           `json:"source"`
@@ -1473,6 +1475,19 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 	return nil, true, fmt.Errorf("server usage status failed: %s", res.Status)
 }
 
+// serverUsageDisplayAccount prefers the server's own identity string, then
+// the record label of an OAuth account, so a usage row reads "email [plan]"
+// rather than a bare email or an opaque codex-owner-<hash>.
+func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
+	if identity := strings.TrimSpace(status.AccountIdentity); identity != "" {
+		return identity
+	}
+	if label := strings.TrimSpace(status.Label); label != "" && label != status.ID && status.AuthMode == accounts.AuthModeOAuth {
+		return label
+	}
+	return ""
+}
+
 func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
 	rows := make([]srUsageRow, 0, len(statuses))
 	for _, status := range statuses {
@@ -1485,7 +1500,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		row := srUsageRow{
 			email:              email,
-			displayAccount:     status.AccountIdentity,
+			displayAccount:     serverUsageDisplayAccount(status),
 			active:             status.Active,
 			authMode:           status.AuthMode,
 			planType:           status.PlanType,
@@ -2044,7 +2059,7 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 	}
 	r.printUploadOutcome(true, fmt.Sprintf("Uploaded %s to server %s.", email, server.Name))
 	if account.Email != email {
-		fmt.Fprintf(r.out, "Workspace account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "Stored as: %s\n", account.DisplayName())
 	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", email, server.Name)

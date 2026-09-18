@@ -1846,6 +1846,10 @@ func proxyClaudeLaunchSettings(baseURL, proxyToken, configDir string, accountIDs
 		"ANTHROPIC_BASE_URL":       baseURL,
 		"ANTHROPIC_AUTH_TOKEN":     proxyToken,
 		"ANTHROPIC_CUSTOM_HEADERS": customHeaders,
+		// Claude fetches /v1/models through this same authenticated route on
+		// startup. Keep discovery, cache, and picker policy in the client;
+		// Anthropic owns the model list, including models released after sr.
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
 	})
 }
 

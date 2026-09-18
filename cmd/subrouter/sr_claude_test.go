@@ -2256,3 +2256,42 @@ func TestPrepareClaudeLoginFastPathPreservesExistingChoices(t *testing.T) {
 		t.Fatalf("existing login method overwritten:\n%s", settings)
 	}
 }
+
+func TestProxyClaudeEnablesUpstreamModelDiscovery(t *testing.T) {
+	body, err := proxyClaudeLaunchSettings("https://router.example", "test-token", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Env         map[string]string `json:"env"`
+		ModelPicker json.RawMessage   `json:"modelPicker"`
+		Model       json.RawMessage   `json:"model"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings.Env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "1" {
+		t.Fatal("pooled launch does not enable upstream model discovery")
+	}
+	if len(settings.ModelPicker) != 0 || len(settings.Model) != 0 {
+		t.Fatal("launcher still owns the model list or default")
+	}
+	for k, v := range settings.Env {
+		if v != "" && (k == "ANTHROPIC_MODEL" || strings.HasPrefix(k, "ANTHROPIC_DEFAULT_") || strings.HasPrefix(k, "ANTHROPIC_CUSTOM_MODEL")) {
+			t.Fatalf("launcher pins a model with %s", k)
+		}
+	}
+	direct, err := managedClaudeLaunchSettings("https://router.example", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var directSettings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(direct, &directSettings); err != nil {
+		t.Fatal(err)
+	}
+	if directSettings.Env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "" {
+		t.Fatal("direct profile discovery was changed")
+	}
+}

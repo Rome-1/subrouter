@@ -2921,13 +2921,15 @@ func migrateDirectoryToShared(source, target string) error {
 		return fmt.Errorf("open profile parent root: %w", err)
 	}
 	defer sourceParent.Close()
-	targetParent, err := openMigrationDirectoryRoot(filepath.Dir(target), true)
+	// The user's shared directory may itself link to an older history store.
+	// Resolve that configured destination once, then keep all migration writes
+	// anchored to its directory handle, just as for a direct shared directory.
+	targetRoot, err := openMigrationDirectoryRoot(target, true)
 	if err != nil {
-		return fmt.Errorf("open shared parent root: %w", err)
+		return fmt.Errorf("open shared state root: %w", err)
 	}
-	defer targetParent.Close()
+	defer targetRoot.Close()
 	sourceName := filepath.Base(source)
-	targetName := filepath.Base(target)
 
 	if info, err := sourceParent.Lstat(sourceName); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		current, readErr := sourceParent.Readlink(sourceName)
@@ -2941,16 +2943,13 @@ func migrateDirectoryToShared(source, target string) error {
 		currentAbs, _ := filepath.Abs(currentPath)
 		targetAbs, _ := filepath.Abs(target)
 		if currentAbs == targetAbs {
-			return targetParent.MkdirAll(targetName, 0o700)
+			return nil
 		}
 		return fmt.Errorf("existing symlink points to %s", current)
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	} else if err == nil && info.Mode()&os.ModeIrregular != 0 {
 		return errors.New("existing profile state is an unsupported reparse point")
-	}
-	if err := targetParent.MkdirAll(targetName, 0o700); err != nil {
-		return err
 	}
 	if info, err := sourceParent.Lstat(sourceName); err == nil {
 		if !info.IsDir() {
@@ -2960,18 +2959,22 @@ func migrateDirectoryToShared(source, target string) error {
 		if err != nil {
 			return fmt.Errorf("open profile state root: %w", err)
 		}
-		defer sourceRoot.Close()
-		targetRoot, err := targetParent.OpenRoot(targetName)
-		if err != nil {
-			return fmt.Errorf("open shared state root: %w", err)
-		}
-		defer targetRoot.Close()
-		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot, source, target); err != nil {
+		sourceRootClosed := false
+		defer func() {
+			if !sourceRootClosed {
+				_ = sourceRoot.Close()
+			}
+		}()
+		if err := mergeDirectoryPreservingConflicts(sourceRoot, targetRoot, source, targetRoot.Name()); err != nil {
 			return err
 		}
 		if err := removeRootContents(sourceRoot); err != nil {
 			return err
 		}
+		if err := sourceRoot.Close(); err != nil {
+			return fmt.Errorf("close migrated profile state: %w", err)
+		}
+		sourceRootClosed = true
 		if err := sourceParent.Remove(sourceName); err != nil {
 			return fmt.Errorf("remove migrated profile state: %w", err)
 		}

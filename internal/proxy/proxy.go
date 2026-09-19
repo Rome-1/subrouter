@@ -344,8 +344,11 @@ func (l *Lifecycle) Status() map[string]any {
 }
 
 type AccountRef struct {
-	mu        sync.RWMutex
-	installMu sync.Mutex
+	// sweepRotation advances once per usage/score sweep to rotate the spawn
+	// order of fetch goroutines across sweeps.
+	sweepRotation atomic.Uint64
+	mu            sync.RWMutex
+	installMu     sync.Mutex
 	// publishGenerationForTest is immutable after AccountRef construction.
 	// Production constructors leave it nil and always use the durable publisher.
 	publishGenerationForTest           func(string) error
@@ -512,7 +515,14 @@ const usageWindowsLastGoodTTL = 15 * time.Minute
 // account's latency.
 const (
 	usageStatusFetchTimeout = 5 * time.Second
+	// accountFetchConcurrency is the floor for parallel usage fetches in one
+	// sweep; accountFetchConcurrencyFor raises it for larger pools.
 	accountFetchConcurrency = 4
+	// accountFetchBatchesPerSweep bounds how many sequential batches a sweep
+	// needs to cover the whole pool, so a growing pool widens the semaphore
+	// instead of starving whichever accounts happen to be queued last.
+	accountFetchBatchesPerSweep = 4
+	maxAccountFetchConcurrency  = 32
 )
 
 const credFailureTTL = credentialExhaustionTTL
@@ -1244,6 +1254,51 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 	return status
 }
 
+// accountFetchConcurrencyFor sizes a sweep's semaphore so a pool of n
+// fetchable accounts fits inside usageStatusFetchTimeout in about
+// accountFetchBatchesPerSweep batches. Small pools keep the historical floor;
+// the cap bounds concurrent upstream connections from one host.
+func accountFetchConcurrencyFor(n int) int {
+	width := (n + accountFetchBatchesPerSweep - 1) / accountFetchBatchesPerSweep
+	if width < accountFetchConcurrency {
+		return accountFetchConcurrency
+	}
+	if width > maxAccountFetchConcurrency {
+		return maxAccountFetchConcurrency
+	}
+	return width
+}
+
+// rotatedIndexes returns 0..n-1 starting at start mod n. Sweeps spawn their
+// fetch goroutines in this order, so a sweep that runs out of budget does not
+// starve the same tail of the pool every time; the next sweep starts further
+// along and the last-good overlay carries the rest.
+func rotatedIndexes(n int, start uint64) []int {
+	out := make([]int, 0, n)
+	if n <= 0 {
+		return out
+	}
+	offset := int(start % uint64(n))
+	for k := 0; k < n; k++ {
+		out = append(out, (k+offset)%n)
+	}
+	return out
+}
+
+// nextSweepStart reserves the next sweep's starting offset and advances the
+// shared rotation by width, the number of accounts one batch admits, so
+// consecutive sweeps that run out of budget cover disjoint stretches of the
+// pool instead of overlapping on all but one account.
+func (r *AccountRef) nextSweepStart(width int) uint64 {
+	if r == nil {
+		return 0
+	}
+	if width < 1 {
+		width = 1
+	}
+	return r.sweepRotation.Add(uint64(width)) - uint64(width)
+}
+
 func acquireAccountFetchSlot(ctx context.Context, sem chan struct{}) bool {
 	if ctx.Err() != nil {
 		return false
@@ -1283,9 +1338,10 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusFetchTimeout)
 	defer cancelSweep()
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, accountFetchConcurrency)
-	for i, stored := range storedAccounts {
-		i, stored := i, stored
+	width := accountFetchConcurrencyFor(len(storedAccounts) + len(claudeProfiles))
+	sem := make(chan struct{}, width)
+	for _, i := range rotatedIndexes(len(storedAccounts), r.nextSweepStart(width)) {
+		i, stored := i, storedAccounts[i]
 		provider := stored.ProviderOrDefault()
 		status := AccountUsageStatus{
 			AccountStatus: AccountStatus{
@@ -3628,8 +3684,10 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	scored := 0
 	var scoreMu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, accountFetchConcurrency)
-	for _, account := range available {
+	width := accountFetchConcurrencyFor(len(available))
+	sem := make(chan struct{}, width)
+	for _, index := range rotatedIndexes(len(available), s.AccountRef.nextSweepStart(width)) {
+		account := available[index]
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}

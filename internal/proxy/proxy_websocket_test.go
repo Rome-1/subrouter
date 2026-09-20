@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -310,7 +311,7 @@ func TestHandlerRejectsOversizedWebSocketMessage(t *testing.T) {
 	}
 	defer response.Body.Close()
 	defer conn.Close()
-	if err := conn.WriteMessage(websocket.BinaryMessage, make([]byte, (8<<20)+1)); err != nil {
+	if err := conn.WriteMessage(websocket.BinaryMessage, make([]byte, maxWebSocketMessageBytes+1)); err != nil {
 		t.Fatalf("write oversized message: %v", err)
 	}
 	_, _, err = conn.ReadMessage()
@@ -320,6 +321,71 @@ func TestHandlerRejectsOversizedWebSocketMessage(t *testing.T) {
 	}
 	if closeErr.Code != websocket.CloseMessageTooBig {
 		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseMessageTooBig)
+	}
+}
+
+// Image-heavy Codex sessions legitimately exceed the old 8 MiB cap; a message
+// under maxWebSocketMessageBytes must be forwarded intact in both directions.
+func TestHandlerForwardsLargeWebSocketMessage(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		messageType, body, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		_ = conn.WriteMessage(messageType, body)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "a@example.com",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "selected-token",
+		}},
+		Sessions:  store,
+		Scheduler: selectacct.NewScheduler(nil),
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+
+	// 12 MiB: over the historical 8 MiB cap, well under the current one, and
+	// non-repeating so a truncated or shifted echo cannot pass accidentally.
+	payload := make([]byte, 12<<20)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteMessage(websocket.BinaryMessage, payload); err != nil {
+		t.Fatalf("write large message: %v", err)
+	}
+	_, echo, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if !bytes.Equal(echo, payload) {
+		t.Fatalf("echo = %d bytes, want %d intact", len(echo), len(payload))
 	}
 }
 
@@ -1274,7 +1340,7 @@ func TestHandlerHandlesBaseURLHeadProbeLocally(t *testing.T) {
 	}
 }
 
-func TestHandlerRejectsProxyMethodsOtherThanGetAndPost(t *testing.T) {
+func TestHandlerRejectsUnsafeProxyMethods(t *testing.T) {
 	upstreamCalled := false
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalled = true
@@ -1301,15 +1367,15 @@ func TestHandlerRejectsProxyMethodsOtherThanGetAndPost(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	request := httptest.NewRequest(http.MethodDelete, "/v1/responses", nil)
+	request := httptest.NewRequest(http.MethodConnect, "/v1/responses", nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
 	if response.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", response.Code)
 	}
-	if got := response.Header().Get("Allow"); got != "GET, POST" {
-		t.Fatalf("Allow = %q, want GET, POST", got)
+	if got := response.Header().Get("Allow"); got != "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS" {
+		t.Fatalf("Allow = %q, want GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS", got)
 	}
 	if upstreamCalled {
 		t.Fatal("unsupported proxy method reached the upstream")
@@ -2079,6 +2145,7 @@ func proxyStoredOAuthAccount(email, tokenPrefix string, exp time.Time) accounts.
 		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
 		AddedAt:               time.Now().UTC().Format(time.RFC3339),
 		Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
+			AccountID:    "workspace:" + email,
 			AccessToken:  proxyTestCodexJWT(email, tokenPrefix+"-access", exp),
 			RefreshToken: tokenPrefix + "-refresh",
 			IDToken:      proxyTestCodexJWT(email, tokenPrefix+"-id", exp),
@@ -2089,9 +2156,10 @@ func proxyStoredOAuthAccount(email, tokenPrefix string, exp time.Time) accounts.
 func proxyTestCodexJWT(email, jwtID string, exp time.Time) string {
 	header, _ := json.Marshal(map[string]string{"alg": "none", "typ": "JWT"})
 	payload, _ := json.Marshal(map[string]any{
-		"exp": exp.Unix(),
-		"iat": time.Now().Add(-time.Minute).Unix(),
-		"jti": jwtID,
+		"exp":                         exp.Unix(),
+		"iat":                         time.Now().Add(-time.Minute).Unix(),
+		"jti":                         jwtID,
+		"https://api.openai.com/auth": map[string]any{"chatgpt_user_id": "user:" + email},
 		"https://api.openai.com/profile": map[string]any{
 			"email": email,
 		},

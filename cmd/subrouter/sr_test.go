@@ -164,7 +164,9 @@ func TestRemoteAddCodexWithDeviceAuthReachesIsolatedLogin(t *testing.T) {
 			_, _ = io.WriteString(w, `{"ok":true}`)
 		case http.MethodPost:
 			if err := json.NewDecoder(req.Body).Decode(&uploaded); err != nil {
-				t.Fatal(err)
+				t.Error("could not decode account import payload")
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
 			}
 			uploadCount++
 			_, _ = io.WriteString(w, `{"ok":true}`)
@@ -174,7 +176,12 @@ func TestRemoteAddCodexWithDeviceAuthReachesIsolatedLogin(t *testing.T) {
 	}))
 	defer server.Close()
 
-	fake := &recordingSRCommandRunner{loginAuth: testCodexAuth("device@example.com", "acct_device")}
+	auth := testCodexAuth("device@example.com", "acct_device")
+	identifier, err := accounts.CodexOAuthIdentifier(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &recordingSRCommandRunner{loginAuth: auth}
 	var out bytes.Buffer
 	runner := srRunner{program: "sr", out: &out, errOut: &out, cmd: fake}
 	remote := srServerConfig{Name: "test", URL: server.URL}
@@ -184,8 +191,8 @@ func TestRemoteAddCodexWithDeviceAuthReachesIsolatedLogin(t *testing.T) {
 	if !fake.hasCommand("codex", "login", "--device-auth") {
 		t.Fatalf("missing isolated device-auth login command: %#v", fake.commands)
 	}
-	if uploadCount != 1 || uploaded.Provider != accounts.ProviderCodex || uploaded.Codex == nil || uploaded.Codex.Email != "device@example.com" {
-		t.Fatalf("account was not uploaded to the serving server: count=%d payload=%#v", uploadCount, uploaded)
+	if uploadCount != 1 || uploaded.Provider != accounts.ProviderCodex || uploaded.Codex == nil || uploaded.Codex.Email != identifier {
+		t.Fatalf("account import validation failed: count=%d providerMatches=%t codexPresent=%t", uploadCount, uploaded.Provider == accounts.ProviderCodex, uploaded.Codex != nil)
 	}
 }
 
@@ -3044,8 +3051,9 @@ func TestSRSwitchDoesNotActivateStaleAuthAfterCommittedRefreshTeardownFails(t *t
 		},
 	})
 	freshID := testJWT(map[string]any{
-		"exp":   time.Now().Add(time.Hour).Unix(),
-		"email": target.Email,
+		"exp":                         time.Now().Add(time.Hour).Unix(),
+		"email":                       target.Email,
+		"https://api.openai.com/auth": map[string]any{"chatgpt_user_id": "user:" + target.Email, "chatgpt_account_id": "acct_target"},
 	})
 	client := &http.Client{Transport: srRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if request.URL.Host == "auth.openai.com" && request.URL.Path == "/oauth/token" {
@@ -4133,7 +4141,7 @@ func TestClaudeUsageGridPrioritizesPopulatedColumnsWithoutTruncatingCore(t *test
 			t.Fatalf("Claude grid missing %q:\n%s", want, got)
 		}
 	}
-	for _, unwanted := range []string{"Opus wk", "Sonnet wk", "Extra", "..."} {
+	for _, unwanted := range []string{"Opus wk", "Sonnet wk", "Extra", "Auto-reload", "..."} {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("Claude grid unexpectedly contains %q:\n%s", unwanted, got)
 		}
@@ -4154,7 +4162,7 @@ func TestClaudeUsageGridNarrowSchemaIsDeterministicAndOmitsEmptyColumns(t *testi
 	if first.String() != second.String() {
 		t.Fatalf("narrow schema is not deterministic:\nfirst:\n%s\nsecond:\n%s", first.String(), second.String())
 	}
-	for _, unwanted := range []string{"Fable wk", "Opus wk", "Sonnet wk", "Extra"} {
+	for _, unwanted := range []string{"Fable wk", "Opus wk", "Sonnet wk", "Extra", "Auto-reload"} {
 		if strings.Contains(first.String(), unwanted) {
 			t.Fatalf("narrow grid unexpectedly contains empty %q column:\n%s", unwanted, first.String())
 		}
@@ -4351,6 +4359,45 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 	}
 	if suffix := exhaustedModelSuffix(windows); !strings.Contains(suffix, "Fable") {
 		t.Fatalf("Use suffix = %q, want it to note Fable is out", suffix)
+	}
+}
+
+func TestClaudeStatusRendersExtraUsageBalanceAndDisabledState(t *testing.T) {
+	t.Setenv("COLUMNS", "220")
+	limit, used := 2000.0, 750.0
+	autoReloadOff := false
+	for _, tc := range []struct {
+		name  string
+		extra *accounts.ExtraUsageInfo
+		want  string
+	}{
+		// The $ figure mirrors Claude's "Monthly spend limit: $X of $Y" line:
+		// metered spend used, not remaining and not the prepaid credit balance
+		// (the OAuth usage API never reports one).
+		{name: "enabled", extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used}, want: "$7.50/$20.00"},
+		{name: "disabled", extra: &accounts.ExtraUsageInfo{IsEnabled: false, MonthlyLimit: &limit, UsedCredits: &used}, want: "off"},
+		{
+			name:  "spend with auto-reload",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used, AutoReload: &autoReloadOff},
+			want:  "Auto-reload",
+		},
+		{
+			name:  "disabled with reason",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: false, MonthlyLimit: &limit, UsedCredits: &used, DisabledReason: "out_of_credits"},
+			want:  "off · out of credits",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			displayUsageRows(&out, []srUsageRow{{
+				email: "claude@example.com", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth,
+				planType: "max", extraUsage: tc.extra,
+				score: selectacct.Score{AccountID: "claude@example.com", Headroom: 0, ShortHeadroom: 0},
+			}}, false)
+			if !strings.Contains(out.String(), tc.want) {
+				t.Fatalf("status output missing %q:\n%s", tc.want, out.String())
+			}
+		})
 	}
 }
 
@@ -4551,14 +4598,16 @@ func testCodexAuth(email, accountID string) accounts.CodexAuthFile {
 		"exp": time.Now().Add(time.Hour).Unix(),
 		"https://api.openai.com/auth": map[string]any{
 			"chatgpt_account_id": accountID,
+			"chatgpt_user_id":    "user:" + email,
 		},
 		"https://api.openai.com/profile": map[string]any{
 			"email": email,
 		},
 	})
 	id := testJWT(map[string]any{
-		"exp":   time.Now().Add(time.Hour).Unix(),
-		"email": email,
+		"exp":                         time.Now().Add(time.Hour).Unix(),
+		"email":                       email,
+		"https://api.openai.com/auth": map[string]any{"chatgpt_user_id": "user:" + email, "chatgpt_account_id": accountID},
 	})
 	return accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
 		AccessToken:  access,
@@ -4647,7 +4696,7 @@ func TestUsageErrorFootnoteShowsProviderAndReaddCommand(t *testing.T) {
 	if !strings.Contains(text, "codex-broken@example.com [codex]: usage fetch failed: 401 Unauthorized (re-add with: sr add)") {
 		t.Fatalf("codex 401 footnote missing provider/re-add hint:\n%s", text)
 	}
-	if !strings.Contains(text, "claude-broken@example.com [claude]: Claude OAuth refresh failed: 400 Bad Request: invalid_grant (re-add with: sr claude add)") {
+	if !strings.Contains(text, "claude-broken@example.com [claude]: Claude OAuth refresh failed: 400 Bad Request: invalid_grant (re-add with: sr add claude)") {
 		t.Fatalf("claude invalid_grant footnote missing provider/re-add hint:\n%s", text)
 	}
 	if strings.Contains(text, "codex-flaky@example.com [codex]: usage fetch failed: connection refused (re-add") {

@@ -831,6 +831,7 @@ func usageRowsFromHostedStatuses(statuses []broker.UsageStatus) []srUsageRow {
 			Windows:            status.Windows,
 			Credits:            status.Credits,
 			ComplimentaryReset: status.ComplimentaryReset,
+			ExtraUsage:         status.ExtraUsage,
 		})
 	}
 	return usageRowsFromServerUsageStatuses(wire)
@@ -1050,15 +1051,20 @@ func (r srRunner) isolatedCodexAccountUpload(
 	if err != nil {
 		return nil, "", err
 	}
+	identifier, err := accounts.CodexOAuthIdentifier(auth)
+	if err != nil {
+		return nil, "", err
+	}
 	return broker.AccountUpload{
 		"provider":              "codex",
+		"accountId":             identifier,
 		"label":                 email,
 		"oauthCredentialOrigin": string(accounts.CodexOAuthOriginIsolatedServerLogin),
 		"tokens": map[string]any{
 			"accessToken":  auth.Tokens.AccessToken,
 			"refreshToken": auth.Tokens.RefreshToken,
 			"idToken":      auth.Tokens.IDToken,
-			"accountID":    auth.Tokens.AccountID,
+			"accountID":    accounts.ExtractChatGPTAccountID(auth),
 		},
 	}, email, nil
 }
@@ -1228,27 +1234,12 @@ func (r srRunner) cloudAccountRepair(
 		return fmt.Errorf("shared account %q not found", accountID)
 	}
 	if target.Kind == "codex" {
-		replacement, email, err := r.isolatedCodexAccountUpload(ctx, *deviceAuth)
+		replacement, _, err := r.isolatedCodexAccountUpload(ctx, *deviceAuth)
 		if err != nil {
 			return err
 		}
-		expectedEmail := strings.TrimSpace(target.Email)
-		if expectedEmail == "" && strings.EqualFold(strings.TrimSpace(email), strings.TrimSpace(target.Label)) {
-			expectedEmail = strings.TrimSpace(target.Label)
-		}
-		if expectedEmail == "" {
-			return fmt.Errorf(
-				"shared account %s does not expose its OAuth identity; shared account was not changed",
-				target.ID,
-			)
-		}
-		if !strings.EqualFold(strings.TrimSpace(email), expectedEmail) {
-			return fmt.Errorf(
-				"logged in as %s, expected %s; shared account was not changed",
-				email,
-				expectedEmail,
-			)
-		}
+		// The server owns the encrypted credential and validates the complete
+		// owner. Its display email may be older than this login's email.
 		replacement["accountId"] = target.ID
 		replacement["label"] = target.Label
 		if _, err := client.RepairAccount(ctx, accountID, replacement); err != nil {

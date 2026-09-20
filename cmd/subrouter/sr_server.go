@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -1100,12 +1101,14 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	}
 	if available {
 		rows := usageRowsFromServerUsageStatuses(usage)
+		fresh := enrichClaudeRowsWithWebBalancesFresh(ctx, rows)
 		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
 		printKimiCLIOnlyStatusHint(r.out, rows)
 		r.printBedrockStatus(ctx, server)
 		r.printAzureCodexStatus(ctx, server)
+		r.pushClaudeWebBalances(ctx, server, fresh)
 		return nil
 	}
 	res, err := r.fetchServerAccountsResponse(ctx, server)
@@ -1320,6 +1323,7 @@ type remoteServerAccountStatus struct {
 	ID          string            `json:"id"`
 	Provider    accounts.Provider `json:"provider"`
 	AuthMode    accounts.AuthMode `json:"auth_mode"`
+	Label       string            `json:"label,omitempty"`
 	Email       string            `json:"email,omitempty"`
 	Source      string            `json:"source"`
 	AuthChecked bool              `json:"auth_checked"`
@@ -1331,6 +1335,7 @@ type remoteServerAccountStatus struct {
 type remoteServerUsageStatus struct {
 	ID                 string                           `json:"id"`
 	Provider           accounts.Provider                `json:"provider"`
+	Label              string                           `json:"label,omitempty"`
 	AuthMode           accounts.AuthMode                `json:"auth_mode"`
 	Email              string                           `json:"email,omitempty"`
 	Source             string                           `json:"source"`
@@ -1352,6 +1357,7 @@ type remoteServerUsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
@@ -1473,6 +1479,19 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 	return nil, true, fmt.Errorf("server usage status failed: %s", res.Status)
 }
 
+// serverUsageDisplayAccount prefers the server's own identity string, then
+// the record label of an OAuth account, so a usage row reads "email [plan]"
+// rather than a bare email or an opaque codex-owner-<hash>.
+func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
+	if identity := strings.TrimSpace(status.AccountIdentity); identity != "" {
+		return identity
+	}
+	if label := strings.TrimSpace(status.Label); label != "" && label != status.ID && status.AuthMode == accounts.AuthModeOAuth {
+		return label
+	}
+	return ""
+}
+
 func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
 	rows := make([]srUsageRow, 0, len(statuses))
 	for _, status := range statuses {
@@ -1485,7 +1504,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		row := srUsageRow{
 			email:              email,
-			displayAccount:     status.AccountIdentity,
+			displayAccount:     serverUsageDisplayAccount(status),
 			active:             status.Active,
 			authMode:           status.AuthMode,
 			planType:           status.PlanType,
@@ -1495,6 +1514,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			windows:            status.Windows,
 			credits:            status.Credits,
 			complimentaryReset: status.ComplimentaryReset,
+			extraUsage:         status.ExtraUsage,
 			provider:           status.Provider,
 			providerHealth:     status.ProviderHealth,
 			authChecked:        status.AuthChecked,
@@ -1562,6 +1582,44 @@ func addServerAdminAuth(req *http.Request, server srServerConfig) {
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+server.AdminToken)
+}
+
+// pushClaudeWebBalances fans freshly fetched Claude prepaid balances out to
+// the server so clients without a local claude.ai web session still see them
+// in usage-status. Display-only: every failure is silent, and the whole push
+// runs under its own short timeout off the status display path.
+func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConfig, balances map[string]float64) {
+	if len(balances) == 0 {
+		return
+	}
+	baseURL, err := protectedServerControlBaseURL(server)
+	if err != nil {
+		return
+	}
+	secured, err := r.securedRequestClientForServer(server, baseURL, 2*time.Second)
+	if err != nil {
+		return
+	}
+	pushCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	for email, cents := range balances {
+		body, err := json.Marshal(map[string]any{"email": email, "balance_cents": cents})
+		if err != nil {
+			continue
+		}
+		req, err := http.NewRequestWithContext(pushCtx, http.MethodPost, baseURL+"/_subrouter/claude-web-balance", bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		addServerAdminAuth(req, server)
+		res, err := secured.Do(req)
+		if err != nil {
+			continue
+		}
+		_, _ = io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}
 }
 
 func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args []string) error {
@@ -1781,9 +1839,9 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 		if account.Provider != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
-		email := strings.TrimSpace(account.Email)
+		email := strings.TrimSpace(account.ID)
 		if email == "" {
-			email = strings.TrimSpace(account.ID)
+			email = strings.TrimSpace(account.Email)
 		}
 		if email == "" || strings.HasPrefix(strings.ToLower(email), "apikey:") {
 			continue
@@ -2007,10 +2065,23 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		return fmt.Errorf("could not extract email from logged-in auth")
 	}
 	if expectedEmail != "" && !strings.EqualFold(email, expectedEmail) {
-		return fmt.Errorf("logged in as %s, expected %s; no account was uploaded", email, expectedEmail)
+		expected, found, lookupErr := r.store.FindStored(expectedEmail)
+		if lookupErr == nil && found && accounts.SameCodexOAuthIdentity(expected.Auth, auth) {
+			expectedEmail = email
+		}
+	}
+	if expectedEmail != "" && !strings.EqualFold(email, expectedEmail) {
+		identifier, identityErr := accounts.CodexOAuthIdentifier(auth)
+		if identityErr != nil || !strings.EqualFold(identifier, expectedEmail) {
+			return fmt.Errorf("logged in as %s, expected %s; no account was uploaded", email, expectedEmail)
+		}
+	}
+	identifier, err := accounts.CodexOAuthIdentifier(auth)
+	if err != nil {
+		return err
 	}
 	account := accounts.StoredCodexAccount{
-		Email:                 email,
+		Email:                 identifier,
 		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
 		AddedAt:               time.Now().UTC().Format(time.RFC3339),
 		Auth:                  auth,
@@ -2019,19 +2090,49 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		return err
 	}
 
-	stopProgress := r.startServerUploadProgress(account.Email, server.Name)
+	stopProgress := r.startServerUploadProgress(email, server.Name)
 	uploadErr := r.postServerAccountImport(ctx, server, serverAccountImportRequest{
 		Provider: accounts.ProviderCodex,
 		Codex:    &account,
 	})
 	stopProgress()
 	if uploadErr != nil {
+		r.printUploadOutcome(false, fmt.Sprintf("Upload of %s to server %s failed.", email, server.Name))
 		return uploadErr
 	}
-	fmt.Fprintf(r.out, "Uploaded %s to server %s.\n", account.Email, server.Name)
+	r.printUploadOutcome(true, fmt.Sprintf("Uploaded %s to server %s.", email, server.Name))
+	if account.Email != email {
+		fmt.Fprintf(r.out, "Stored as: %s\n", account.DisplayName())
+	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
-	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", account.Email, server.Name)
+	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", email, server.Name)
 	return nil
+}
+
+// printUploadOutcome reports a credential upload as one line the user can
+// read at a glance: a green check on success, a red cross on failure. The
+// failure reason itself follows on the error path, so a failed line is never
+// the only signal.
+func (r srRunner) printUploadOutcome(ok bool, message string) {
+	if ok {
+		fmt.Fprintln(r.out, uploadOutcomeLine(colorEnabled(r.out), true, message))
+		return
+	}
+	out := r.errOut
+	if out == nil {
+		out = r.out
+	}
+	if out == nil {
+		return
+	}
+	fmt.Fprintln(out, uploadOutcomeLine(colorEnabled(out), false, message))
+}
+
+func uploadOutcomeLine(colored, ok bool, message string) string {
+	if ok {
+		return style(colored, ansiGreen, "\u2713 "+message)
+	}
+	return style(colored, ansiRed, "\u2717 "+message)
 }
 
 func (r srRunner) startServerUploadProgress(email, serverName string) func() {

@@ -783,7 +783,7 @@ func TestSRAddUsesDefaultRemoteServer(t *testing.T) {
 	var out bytes.Buffer
 	fake := &recordingSRCommandRunner{loginAuth: testCodexAuth("fresh@example.com", "acct_fresh")}
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake, client: remote.Client()}
-	if err := runner.run(context.Background(), []string{"add", "--device-auth"}); err != nil {
+	if err := runner.run(context.Background(), []string{"add", "codex", "--device-auth"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -841,7 +841,7 @@ func TestSRAddUsesExplicitRemoteServerWhileTeamStorageIsActive(t *testing.T) {
 	var out bytes.Buffer
 	fake := &recordingSRCommandRunner{loginAuth: testCodexAuth("fresh@example.com", "acct_fresh")}
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake, client: remote.Client()}
-	if err := runner.run(context.Background(), []string{"add", "--device-auth"}); err != nil {
+	if err := runner.run(context.Background(), []string{"add", "codex", "--device-auth"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1241,7 +1241,11 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if gotPreflightRequests != 1 || gotImportRequests != 1 {
 		t.Fatalf("account import requests = preflight:%d post:%d, want 1 each", gotPreflightRequests, gotImportRequests)
 	}
-	if gotImported.Email != "bob@example.com" || gotImported.Auth.Tokens == nil || gotImported.Auth.Tokens.RefreshToken != freshServer.Tokens.RefreshToken {
+	expectedIdentifier, err := accounts.CodexOAuthIdentifier(freshServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotImported.Email != expectedIdentifier || gotImported.Auth.Tokens == nil || gotImported.Auth.Tokens.RefreshToken != freshServer.Tokens.RefreshToken {
 		t.Fatalf("server did not receive fresh OAuth account for bob@example.com")
 	}
 	if gotImported.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {

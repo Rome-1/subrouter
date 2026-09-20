@@ -164,6 +164,7 @@ func run(args []string) error {
 }
 
 func runForProgram(program string, args []string) error {
+	args = normalizeProviderAddArgs(args)
 	if len(args) == 0 {
 		if program == "sr" {
 			return srForProgram(program, nil)
@@ -180,6 +181,8 @@ func runForProgram(program string, args []string) error {
 	}
 
 	switch args[0] {
+	case "naked", "direct":
+		return naked(args[1:])
 	case "serve":
 		return serve(args[1:])
 	case "supervise":
@@ -278,6 +281,8 @@ var directSRCommands = map[string]struct{}{
 	"g":                {},
 	"az":               {},
 	"azure":            {},
+	"oai":              {},
+	"openai":           {},
 	"gemini":           {},
 	"gui":              {},
 	"gui-switch":       {},
@@ -611,6 +616,20 @@ func serve(args []string) error {
 		slog.Info("azure codex fallback disabled by SUBROUTER_AZURE_CODEX_DISABLED",
 			"reenable", "unset SUBROUTER_AZURE_CODEX_DISABLED and restart")
 	}
+	codexEgressConfig, err := codexEgressConfigFromEnvironment(*sessionPath)
+	if err != nil {
+		return err
+	}
+	if codexEgressConfig != nil {
+		slog.Info("codex regional egress enabled", "proxy_count", len(codexEgressConfig.Proxies))
+	}
+	codexOverloadConfig, err := codexOverloadFailoverConfigFromEnvironment()
+	if err != nil {
+		return err
+	}
+	if codexOverloadConfig != nil {
+		slog.Info("codex overload account failover enabled", "max_accounts", codexOverloadConfig.MaxAccounts, "mark_ttl", codexOverloadConfig.MarkTTL)
+	}
 	if azureCodexConfig != nil {
 		azureCodexConfig.CostLogPath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-cost.jsonl")
 		azureCodexConfig.PinStorePath = filepath.Join(filepath.Dir(*sessionPath), "azure-codex-pins.json")
@@ -805,6 +824,8 @@ func serve(args []string) error {
 		// cache_control TTL upgrade on the Bedrock path.
 		ClaudeFableCacheTTLUpgradeOff: envTrue("SUBROUTER_FABLE_CACHE_1H_OFF"),
 		AzureCodex:                    azureCodexConfig,
+		CodexEgress:                   codexEgressConfig,
+		CodexOverloadFailover:         codexOverloadConfig,
 		FableBedrockPrimary:           fableBedrockEnabled,
 		Transcripts:                   transcript.NewRecorder(*transcriptDir),
 	}

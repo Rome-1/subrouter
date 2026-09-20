@@ -32,7 +32,7 @@ Set up Subrouter as a shared production service.
 
 Inputs:
 - GCP project, zone, and instance: <project> <zone> <instance>
-- Public server URL: https://sr.cmux.com
+- Public server URL: http://cmux-lawrence:31415
 - Local server nickname: team
 
 Rules:
@@ -48,15 +48,15 @@ Steps:
 1. Configure the GCP project and publish the released service with deploy/gcp/publish-subrouter.sh. The installer must generate and provision its protected account-import token without printing it.
 2. Verify from this client machine:
    sr server status team
-   curl -fsS https://sr.cmux.com/_subrouter/health
-   curl -fsS https://sr.cmux.com/_subrouter/ready
+   curl -fsS http://cmux-lawrence:31415/_subrouter/health
+   curl -fsS http://cmux-lawrence:31415/_subrouter/ready
 3. Create server-owned Codex OAuth chains:
    sr server sync team
    Follow each OAuth flow. Do not upload local refresh tokens.
 4. Verify:
    sr server status team
-   curl -fsS https://sr.cmux.com/_subrouter/health
-   curl -fsS https://sr.cmux.com/_subrouter/ready
+   curl -fsS http://cmux-lawrence:31415/_subrouter/health
+   curl -fsS http://cmux-lawrence:31415/_subrouter/ready
 5. Report:
    - systemd active/running status
    - health and readiness result
@@ -411,6 +411,14 @@ Codex Desktop is separate from the CLI wrapper. Its app-server reads `CODEX_HOME
 
 ## Codex accounts
 
+Personal and team ChatGPT workspaces can use the same email. Add each workspace
+with a separate `sr add codex` login and select the workspace in the browser.
+New accounts use a stable key derived from the provider user ID and workspace
+ID. Email is display data. Existing identifiers stay valid, including after an
+email change. Use the full identifier from `sr list` to switch or remove one
+workspace. Adding, refreshing, or repairing one workspace does not
+replace another workspace's credentials.
+
 Subrouter has a native Go implementation of the Codex account manager. It reads and writes its account store under Subrouter's data directory:
 
 ```text
@@ -460,8 +468,8 @@ OpenCode uses XDG data home, so `XDG_DATA_HOME` changes its auth path. pi uses `
 Claude profiles are also native Go and use the same Subrouter store:
 
 ```bash
-sr claude add <profile>                 # 1-year setup token (default)
-sr claude add <profile> --token -       # paste an existing setup token on stdin
+sr add claude <profile>                 # 1-year setup token (default)
+sr add claude <profile> --token -       # paste an existing setup token on stdin
 sr claude login <profile>               # classic browser OAuth login (refresh token)
 sr claude list
 sr claude switch <profile>
@@ -470,14 +478,14 @@ sr claude run <profile>
 sr claude proxy [claude args...]
 ```
 
-`sr claude add` runs `claude setup-token`, which mints a Claude subscription
+`sr add claude` runs `claude setup-token`, which mints a Claude subscription
 access token that is valid for one year and has no refresh token. Paste the
 printed token at the prompt (or pass it with `--token <token>` / `--token -`);
 Subrouter verifies it against Anthropic, records the expiry, and stores it
 without ever calling the OAuth refresh endpoint for that profile. `sr claude
-list`, `sr claude add`, and server status print the expiry date, warn inside
+list`, `sr add claude`, and server status print the expiry date, warn inside
 the last 30 days, and name the re-add command once the token has expired,
-because a setup token cannot renew itself. `sr claude login` (or `sr claude add
+because a setup token cannot renew itself. `sr claude login` (or `sr add claude
 --oauth`) is the earlier flow: Claude Code's browser OAuth writes a refreshable
 credential and the profile name defaults to the account email. Profiles created
 that way keep refreshing exactly as before; the two kinds coexist in one store
@@ -928,8 +936,11 @@ Prove the route without waiting for an outage:
 sr az status          # which endpoints the daemon armed
 sr az test            # one forced request; run twice, the second reports cached tokens
 sr az cost            # what the fallback has spent
-sr az codex exec "…"  # run Codex with every request forced onto Azure
+sr az codex exec "…"  # Azure only, also: sr azure codex
+sr oai codex exec "…" # OpenAI API keys only, also: sr openai codex
 ```
+
+`sr az codex` and `sr oai codex` use the daemon’s configured API keys and require a daemon that advertises `codex_provider_selection` in its health response. Azure selects `/openai/v1` endpoints; OpenAI selects `/v1` endpoints from the same configuration. Failures never cross providers or reach the subscription pool. Unsupported paths (including remote compaction and the subscription model catalog) return an error. Both launchers disable WebSockets and use HTTP Responses.
 
 `sr az test` sends a fixed prompt long enough to be cacheable, so the second run's `cached=` count is real evidence that the prompt cache is being reused. Forced requests skip the pool and never pin the session; a broken endpoint surfaces as an error instead of a silent ChatGPT answer.
 

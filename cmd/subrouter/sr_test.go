@@ -191,8 +191,16 @@ func TestRemoteAddCodexWithDeviceAuthReachesIsolatedLogin(t *testing.T) {
 	if !fake.hasCommand("codex", "login", "--device-auth") {
 		t.Fatalf("missing isolated device-auth login command: %#v", fake.commands)
 	}
-	if uploadCount != 1 || uploaded.Provider != accounts.ProviderCodex || uploaded.Codex == nil || uploaded.Codex.Email != identifier {
-		t.Fatalf("account import validation failed: count=%d providerMatches=%t codexPresent=%t", uploadCount, uploaded.Provider == accounts.ProviderCodex, uploaded.Codex != nil)
+	codexPresent := uploaded.Codex != nil
+	accountIDMatches := codexPresent && uploaded.Codex.Email == identifier
+	completeTokens := codexPresent && uploaded.Codex.Auth.Tokens != nil &&
+		uploaded.Codex.Auth.Tokens.AccessToken != "" &&
+		uploaded.Codex.Auth.Tokens.RefreshToken != "" &&
+		uploaded.Codex.Auth.Tokens.IDToken != ""
+	if uploadCount != 1 || uploaded.Provider != accounts.ProviderCodex || !codexPresent || !accountIDMatches || !completeTokens {
+		// Never include the decoded request in a failure message: it contains the
+		// OAuth access, refresh, and ID tokens sent for account import.
+		t.Fatalf("account import validation failed: count=%d providerMatches=%t codexPresent=%t accountIDMatches=%t completeTokens=%t", uploadCount, uploaded.Provider == accounts.ProviderCodex, codexPresent, accountIDMatches, completeTokens)
 	}
 }
 
